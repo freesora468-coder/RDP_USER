@@ -1,0 +1,83 @@
+name: RDP Session with Tailscale
+
+on:
+  workflow_dispatch:  # Allows manual triggering
+
+jobs:
+  rdp:
+    runs-on: windows-latest   # Use Windows runner for RDP
+
+    steps:
+      - name: Set up job
+        run: echo "Starting RDP session setup"
+
+      - name: Enable Remote Desktop
+        run: |
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+        shell: pwsh
+
+      - name: Create RDP User
+        run: |
+          $password = ConvertTo-SecureString "${{ secrets.RDP_PASSWORD }}" -AsPlainText -Force
+          New-LocalUser -Name "rdpuser" -Password $password -FullName "RDP User" -Description "RDP access user"
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "rdpuser"
+        shell: pwsh
+
+      - name: Set runneradmin password (optional)
+        run: |
+          $adminPassword = ConvertTo-SecureString "${{ secrets.RDP_PASSWORD }}" -AsPlainText -Force
+          Set-LocalUser -Name "runneradmin" -Password $adminPassword
+        shell: pwsh
+
+      - name: Connect to Tailscale (OAuth)
+        uses: tailscale/github-action@v4
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+          tags: tag:ci   # 👈 REQUIRED: Add tags that your OAuth client is allowed to use
+
+      - name: Get Tailscale IP
+        id: tailscale-ip
+        run: |
+          $ip = (tailscale ip -4).Trim()
+          echo "ip=$ip" >> $env:GITHUB_OUTPUT
+        shell: pwsh
+
+      - name: Restrict RDP Firewall to Tailscale Only
+        run: |
+          # Remove any existing RDP firewall rule that allows all
+          Remove-NetFirewallRule -DisplayGroup "Remote Desktop" -ErrorAction SilentlyContinue
+          # Add a new rule that allows RDP only from Tailscale IP range (100.64.0.0/10)
+          New-NetFirewallRule -DisplayName "Remote Desktop (Tailscale only)" -Direction Inbound -Protocol TCP -LocalPort 3389 -RemoteAddress "100.64.0.0/10" -Action Allow
+        shell: pwsh
+
+      - name: Display Connection Info
+        run: |
+          Write-Host "============================================"
+          Write-Host "RDP session is ready!"
+          Write-Host "Connect using the Tailscale IP: ${{ steps.tailscale-ip.outputs.ip }}"
+          Write-Host "Username: rdpuser"
+          Write-Host "Password: ${{ secrets.RDP_PASSWORD }}"
+          Write-Host "============================================"
+          Write-Host "Session will stay alive for 6 hours (adjust as needed)."
+        shell: pwsh
+
+      - name: Keep Session Alive
+        run: |
+          # This keeps the runner alive for up to 6 hours (or until manually cancelled)
+          for ($i = 0; $i -lt 360; $i++) {
+            Write-Host "Keeping session alive... ($i/360)"
+            Start-Sleep -Seconds 60
+          }
+        shell: pwsh
+
+      # Cleanup steps (run even if previous steps fail)
+      - name: Post Connect to Tailscale (OAuth)
+        uses: tailscale/github-action@v4
+        if: always()
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+          tags: tag:ci
+          args: logout
